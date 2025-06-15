@@ -1,0 +1,180 @@
+import time, os, threading, random, psutil, socketio, socket
+from controller.geraElementos import cricacaoElementos
+from controller.criaPessoa import criacaoPessoasCidades
+from controller.interface import interfaceGrafica
+from utils.operacoes import imprimirCidade
+from dotenv import load_dotenv
+from flask import Flask
+from flask_socketio import SocketIO
+
+load_dotenv()
+
+DELAY = 5
+PORTA = 6000
+CIDADES = {}
+NUM_BLOCOS = int(os.getenv("NUM_BLOCOS"))
+NUM_SALAS = int(os.getenv("NUM_SALAS"))
+NUM_PESSOAS = int(os.getenv("NUM_PESSOAS"))
+MAX_PESSOAS_CORREDOR = int(os.getenv("MAX_PESSOAS_CORREDOR"))
+MAX_PESSOAS_SALAS = int(os.getenv("MAX_PESSOAS_SALAS"))
+THREADS = int(os.getenv("THREADS"))  # Máximo de threads simultâneas
+TEMPO_EXECUCAO = int(os.getenv("TEMPO_EXECUCAO"))
+CIDADE = cricacaoElementos(NUM_BLOCOS, NUM_SALAS, NUM_PESSOAS, MAX_PESSOAS_CORREDOR, MAX_PESSOAS_SALAS)
+conexaoClient = socketio.Client()
+semaforoBlocos = threading.Semaphore(7)
+semaforoSalas = threading.Semaphore(2)
+listaThreadsBlocos = []
+listaThreadsSalas = []
+
+#Inicia do servidor Flask com o SocketIO
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+def corredorPrincipal():
+    CorredorPrincipal = CIDADE.getCorredor()
+    while True:
+        listaDestinos = CIDADE.getlistaBlocos()
+        if CorredorPrincipal.getQuantidadePessoas() > 0:
+            resultPessoa = CorredorPrincipal.executaCorredor(listaDestinos, list(CIDADES.keys()))
+            if resultPessoa != False:
+                conexaoCidade(resultPessoa)
+        time.sleep(.5)
+
+def CorredorBloco(bloco):
+    corredor = bloco.getCorredor()
+    destinosCorredor = bloco.getListaSalas()
+    corredorPrincipal =CIDADE.getCorredor()
+    while True:
+        if corredor.getQuantidadePessoas() > 0:
+            with semaforoBlocos:
+                corredor.executaCorredor(destinosCorredor, corredorPrincipal)
+        time.sleep(0.5)
+
+def TreadsBlocos():
+    random.shuffle(listaThreadsBlocos)
+    for threadBloco in listaThreadsBlocos:
+        threadBloco.start()
+
+def salas(sala, bloco):
+    corredor = bloco.getCorredor()
+    while True:
+        if sala.getQuantidadePessoas() > 0:
+            with semaforoSalas:
+                sala.executaSalas([corredor])
+        time.sleep(2)
+
+def TreadsSalas():
+    random.shuffle(listaThreadsSalas)
+    for threadSala in listaThreadsSalas:
+        threadSala.start()
+#Pega o IP do radmin VPN
+def configuraRangeIp():
+    for interface, IPsLocalizados in psutil.net_if_addrs().items():
+        for ip in IPsLocalizados:
+            if ip.family == socket.AF_INET and ip.address.startswith("26."):
+                return ip.address
+    return None
+
+#Recebe uma mensagem e envia um retorno de volta
+@socketio.on('pessoa')
+def buscaPessoa(data):
+    nomePessoa = data.get('nome')  # Acessa o nome da pessoa
+    cidade = data.get('cidade')
+    pessoa = criacaoPessoasCidades(nomePessoa, cidade)
+    CIDADE.getCorredor().adicionaPessoa(pessoa)
+    print(f"----> {pessoa.getNome()} Entrou na Cidade")
+
+def procurarCidades():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("", PORTA))
+    sock.settimeout(1)
+    MEUIP = configuraRangeIp()
+
+    while True:
+        try:
+            data, ipLocalizado = sock.recvfrom(1024)
+            if ipLocalizado[0] == MEUIP:
+                continue
+
+            if data.decode() == "DISCOVERY":
+                ip = ipLocalizado[0]
+                if ip not in CIDADES:
+                    CIDADES[ip] = time.time()
+        except socket.timeout:
+            pass
+
+#Vai enviar Broadcast para todas as cidades que se conectarem na rede
+def enviaBroadcast():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+    while True:
+        sock.sendto(b"DISCOVERY", ("255.255.255.255", PORTA))
+        time.sleep(DELAY)
+
+# Escolhe uma cidade na lista de cidades ativas
+def escolheCidade():
+    if CIDADES:
+        return random.choice(list(CIDADES.keys()))
+    return None
+
+# Conecta a uma cidade ativa
+def conexaoCidade(cidade):
+    ip = cidade[0]
+    pessoa = cidade[1]
+    if ip:
+        caminho = f"http://{ip}:5000"
+        try:
+            conexaoClient.connect(caminho)
+            print(f"Conexão realizada a {caminho}")
+            
+            enviaDados(pessoa)
+
+            conexaoClient.disconnect()
+            print(f"Desconectado de {caminho}")
+            
+        except Exception as e:
+            print(f"Falha ao conectar a {caminho}: {e}")
+
+# Envia uma mensagem ao Servidor
+def enviaDados(pessoa):
+    if conexaoClient.connected:
+        conexaoClient.emit('pessoa', {'nome': pessoa.getNome(), 'cidade': pessoa.getOrigem()},)
+        print(f"----> Enviando {pessoa.getNome()} para a nova cidade")
+
+def finalizar_servidor():
+    time.sleep(TEMPO_EXECUCAO)
+    time.sleep(2)
+    os._exit(0)
+
+threading.Thread(target=procurarCidades, daemon=True).start()
+threading.Thread(target=enviaBroadcast, daemon=True).start()
+CorredorPrincipal = threading.Thread(target=corredorPrincipal)
+CorredorPrincipal.daemon = True
+CorredorPrincipal.start()
+
+blocos = CIDADE.getlistaBlocos()
+for bloco in blocos:
+    CorredorBlocoThread = threading.Thread(target=CorredorBloco, args=(bloco,))
+    CorredorBlocoThread.daemon = True
+    listaThreadsBlocos.append(CorredorBlocoThread)
+TreadsBlocos()
+
+for bloco in blocos:
+    for sala in bloco.getListaSalas():
+        salaThread = threading.Thread(target=salas, args=(sala, bloco,))
+        salaThread.daemon = True
+        listaThreadsSalas.append(salaThread)
+TreadsSalas()
+
+# frontThread = threading.Thread(target=imprimirCidade, args=(CIDADE,), daemon=True)
+# frontThread.daemon = True
+# frontThread.start()
+
+finalizaThreads = threading.Thread(target=finalizar_servidor)
+finalizaThreads.daemon = True
+finalizaThreads.start()
+
+if __name__ == '__main__':
+    MEUIP = configuraRangeIp() or "0.0.0.0"
+    socketio.run(app, host=MEUIP, port=5000)
